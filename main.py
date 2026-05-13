@@ -1,110 +1,83 @@
 import os
 import io
-import requests
-import pandas as pd
-import pdfplumber
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pypdf import PdfReader, PdfWriter
-from googletrans import Translator
+from PyPDF2 import PdfReader, PdfWriter
+from dotenv import load_dotenv
 
-app = FastAPI()
+# Environment variables (.env file) load karne ke liye
+load_dotenv()
 
+app = FastAPI(title="ITSPDF Utility API")
+
+# Netlify frontend ko connect karne ke liye CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], 
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- FREE AI CONFIG ---
-HF_TOKEN = "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" 
-HF_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.2"
-headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+# --- SECURE TOKEN SYSTEM ---
+# Ye 'os' library system ki settings se token uthayegi
+# Aapko code mein MyAi... likhne ki zaroorat nahi
+API_TOKEN = os.getenv("MYAI_TOKEN")
 
-translator = Translator()
-
-def get_free_ai_response(prompt: str):
-    payload = {
-        "inputs": f"<s>[INST] {prompt} [/INST]",
-        "parameters": {"max_new_tokens": 500, "temperature": 0.7}
+@app.get("/")
+async def health_check():
+    return {
+        "status": "online",
+        "project": "ITSPDF",
+        "auth_configured": API_TOKEN is not None
     }
-    try:
-        response = requests.post(HF_API_URL, headers=headers, json=payload)
-        result = response.json()
-        return result[0]['generated_text'].split("[/INST]")[-1].strip()
-    except:
-        return "AI is busy, please try again."
 
-# --- UPDATED EXCEL TOOL (GROUP BY HEADER TABS) ---
-
-@app.post("/pdf-to-excel")
-async def pdf_to_excel(file: UploadFile = File(...)):
+# 1. PDF MERGE FUNCTION
+@app.post("/merge")
+async def merge_pdfs(files: list[UploadFile] = File(...)):
+    if not API_TOKEN:
+        raise HTTPException(status_code=500, detail="Server Error: Token missing in environment variables.")
+    
+    pdf_writer = PdfWriter()
     try:
-        content = await file.read()
-        # Dictionary taake hum headers ke mutabiq data group kar saken
-        grouped_data = {}
-        
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table and len(table) > 1:
-                    # Header ko string bana kar key banayenge (e.g. "Name-Age-Salary")
-                    header_tuple = tuple(table[0])
-                    header_name = "-".join([str(h) for h in header_tuple if h])[:30] # Excel tab limit
-                    
-                    if header_name not in grouped_data:
-                        grouped_data[header_name] = {"columns": table[0], "rows": []}
-                    
-                    # Data rows add karein
-                    grouped_data[header_name]["rows"].extend(table[1:])
-        
-        if not grouped_data:
-            raise HTTPException(status_code=400, detail="No tables found.")
+        for file in files:
+            content = await file.read()
+            pdf_reader = PdfReader(io.BytesIO(content))
+            for page in pdf_reader.pages:
+                pdf_writer.add_page(page)
 
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            for sheet_title, content in grouped_data.items():
-                # Har unique header ke liye ek alag sheet tab
-                df = pd.DataFrame(content["rows"], columns=content["columns"])
-                df.to_excel(writer, sheet_name=sheet_title, index=False)
-            
+        pdf_writer.write(output)
         output.seek(0)
+        
         return StreamingResponse(
-            output, 
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=jasonpdf_header_tabs.xlsx"}
+            output,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=itspdf_merged.pdf"}
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
-# --- OTHER ENDPOINTS ---
+# 2. PDF INFO/METADATA FUNCTION
+@app.post("/metadata")
+async def get_metadata(file: UploadFile = File(...)):
+    try:
+        pdf_reader = PdfReader(io.BytesIO(await file.read()))
+        info = pdf_reader.metadata
+        return {
+            "filename": file.filename,
+            "pages": len(pdf_reader.pages),
+            "author": info.author if info.author else "Unknown",
+            "creator": info.creator if info.creator else "Unknown"
+        }
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
-@app.post("/ai-summary")
-async def ai_summary(file: UploadFile = File(...)):
-    pdf_content = await file.read()
-    reader = PdfReader(io.BytesIO(pdf_content))
-    text = "".join([page.extract_text() for page in reader.pages[:5]])
-    return {"result": get_free_ai_response(f"Summarize:\n{text[:3000]}")}
-
-@app.post("/ai-translate")
-async def ai_translate(file: UploadFile = File(...), target_lang: str = Form("ur")):
-    pdf_content = await file.read()
-    reader = PdfReader(io.BytesIO(pdf_content))
-    text = reader.pages[0].extract_text()
-    return {"result": translator.translate(text[:2500], dest=target_lang).text}
-
-@app.post("/merge-pdf")
-async def merge_pdf(files: list[UploadFile] = File(...)):
-    merger = PdfWriter()
-    for file in files:
-        merger.append(io.BytesIO(await file.read()))
-    out = io.BytesIO()
-    merger.write(out)
-    out.seek(0)
-    return StreamingResponse(out, media_type="application/pdf")
-
-@app.get("/health")
-def health():
-    return {"status": "online"}
+# 3. SECURITY CHECK ROUTE (Testing ke liye)
+@app.get("/verify-token")
+async def verify():
+    if API_TOKEN:
+        # Security ke liye poora token nahi dikhayenge, sirf check karenge
+        return {"message": "Token is active and hidden", "prefix": API_TOKEN[:7]}
+    return {"message": "Token not found!"}
