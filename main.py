@@ -7,12 +7,10 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pypdf import PdfReader, PdfWriter
-import fitz  # PyMuPDF
 from googletrans import Translator
 
 app = FastAPI()
 
-# CORS taake Netlify frontend connect ho sake
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,85 +32,79 @@ def get_free_ai_response(prompt: str):
     }
     try:
         response = requests.post(HF_API_URL, headers=headers, json=payload)
-        if response.status_code != 200:
-            return "AI model is loading... Please wait 30 seconds."
         result = response.json()
         return result[0]['generated_text'].split("[/INST]")[-1].strip()
-    except Exception:
-        return "AI service temporarily unavailable."
+    except:
+        return "AI is busy, please try again."
 
-# --- AI ENDPOINTS ---
-
-@app.post("/ai-summary")
-async def ai_summary(file: UploadFile = File(...)):
-    try:
-        pdf_content = await file.read()
-        reader = PdfReader(io.BytesIO(pdf_content))
-        text = "".join([page.extract_text() for page in reader.pages[:5]])
-        prompt = f"Summarize this in bullet points:\n\n{text[:3000]}"
-        return {"result": get_free_ai_response(prompt)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/ai-translate")
-async def ai_translate(file: UploadFile = File(...), target_lang: str = Form("ur")):
-    try:
-        pdf_content = await file.read()
-        reader = PdfReader(io.BytesIO(pdf_content))
-        text = reader.pages[0].extract_text()
-        translated = translator.translate(text[:2500], dest=target_lang)
-        return {"result": translated.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --- EXCEL TOOL (MERGED TABLES LOGIC) ---
+# --- UPDATED EXCEL TOOL (GROUP BY HEADER TABS) ---
 
 @app.post("/pdf-to-excel")
 async def pdf_to_excel(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        all_tables_data = []
+        # Dictionary taake hum headers ke mutabiq data group kar saken
+        grouped_data = {}
         
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
                 table = page.extract_table()
-                if table:
-                    # Table ko DataFrame mein convert karna
-                    df = pd.DataFrame(table[1:], columns=table[0])
-                    all_tables_data.append(df)
+                if table and len(table) > 1:
+                    # Header ko string bana kar key banayenge (e.g. "Name-Age-Salary")
+                    header_tuple = tuple(table[0])
+                    header_name = "-".join([str(h) for h in header_tuple if h])[:30] # Excel tab limit
+                    
+                    if header_name not in grouped_data:
+                        grouped_data[header_name] = {"columns": table[0], "rows": []}
+                    
+                    # Data rows add karein
+                    grouped_data[header_name]["rows"].extend(table[1:])
         
-        if not all_tables_data:
+        if not grouped_data:
             raise HTTPException(status_code=400, detail="No tables found.")
-
-        # Saare pages ke tables ko aik hi sheet mein jorna
-        final_df = pd.concat(all_tables_data, ignore_index=True)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            final_df.to_excel(writer, sheet_name="MasterData", index=False)
+            for sheet_title, content in grouped_data.items():
+                # Har unique header ke liye ek alag sheet tab
+                df = pd.DataFrame(content["rows"], columns=content["columns"])
+                df.to_excel(writer, sheet_name=sheet_title, index=False)
             
         output.seek(0)
         return StreamingResponse(
             output, 
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=jasonpdf_excel.xlsx"}
+            headers={"Content-Disposition": "attachment; filename=jasonpdf_header_tabs.xlsx"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- STANDARD PDF TOOLS ---
+# --- OTHER ENDPOINTS ---
+
+@app.post("/ai-summary")
+async def ai_summary(file: UploadFile = File(...)):
+    pdf_content = await file.read()
+    reader = PdfReader(io.BytesIO(pdf_content))
+    text = "".join([page.extract_text() for page in reader.pages[:5]])
+    return {"result": get_free_ai_response(f"Summarize:\n{text[:3000]}")}
+
+@app.post("/ai-translate")
+async def ai_translate(file: UploadFile = File(...), target_lang: str = Form("ur")):
+    pdf_content = await file.read()
+    reader = PdfReader(io.BytesIO(pdf_content))
+    text = reader.pages[0].extract_text()
+    return {"result": translator.translate(text[:2500], dest=target_lang).text}
 
 @app.post("/merge-pdf")
 async def merge_pdf(files: list[UploadFile] = File(...)):
     merger = PdfWriter()
     for file in files:
-        content = await file.read()
-        merger.append(io.BytesIO(content))
+        merger.append(io.BytesIO(await file.read()))
     out = io.BytesIO()
     merger.write(out)
     out.seek(0)
-    return StreamingResponse(out, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=merged.pdf"})
+    return StreamingResponse(out, media_type="application/pdf")
 
 @app.get("/health")
 def health():
-    return {"status": "online", "mode": "free-tier"}
+    return {"status": "online"}
