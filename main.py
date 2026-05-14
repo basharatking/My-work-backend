@@ -1,64 +1,73 @@
-import os
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
-from mangum import Mangum
-import pandas as pd
+"""CatchPDF v9 - Premium SaaS Backend"""
+import io, os, hashlib
+from pathlib import Path
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import pdfplumber
-from dotenv import load_dotenv
+import openpyxl
+from openpyxl.styles import Font, PatternFill
 
-# Environment variables load karne ke liye
-load_dotenv()
+app = FastAPI(title="CatchPDF")
 
-app = FastAPI()
+# CORS for Netlify
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Netlify settings se token uthane ke liye
-# Yaad rahe Netlify mein Key: MYAI_TOKEN honi chahiye
-API_TOKEN = os.getenv("MYAI_TOKEN")
+def stem(f): return Path(f or "file").stem
 
-@app.get("/")
-def home():
-    return {"message": "Welcome to ITSPDF API. System is Live!"}
+@app.post("/pdf-to-excel")
+async def pdf_to_excel(file: UploadFile = File(...)):
+    d = await file.read()
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    
+    table_groups = {} 
+    header_fill = PatternFill("solid", fgColor="4F46E5")
+    header_font = Font(bold=True, color="FFFFFF")
 
-@app.get("/verify-token")
-def verify():
-    if API_TOKEN:
-        # Security ki wajah se pura token nahi dikhayenge
-        return {"status": "Active", "prefix": API_TOKEN[:7]}
-    return {"status": "Error", "message": "Token not found in Netlify settings"}
-
-@app.post("/convert-to-excel")
-async def convert_pdf_to_excel(file: UploadFile = File(...)):
-    # 1. Token Check
-    if not API_TOKEN:
-        raise HTTPException(status_code=500, detail="API Token missing in server settings")
-
-    # 2. PDF processing
     try:
-        all_data = []
-        with pdfplumber.open(file.file) as pdf:
+        with pdfplumber.open(io.BytesIO(d)) as pdf:
             for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    # Table data ko list mein add karna
-                    df = pd.DataFrame(table[1:], columns=table[0])
-                    all_data.append(df)
+                tables = page.extract_tables()
+                for tbl in tables:
+                    if not tbl or not any(tbl[0]): continue
+                    
+                    # Logic: Group by Header Hash
+                    headers = [str(c or "").strip() for c in tbl[0]]
+                    header_hash = hashlib.md5("".join(headers).lower().encode()).hexdigest()
+                    
+                    if header_hash not in table_groups:
+                        table_groups[header_hash] = {
+                            "name": f"Sheet_{len(table_groups)+1}",
+                            "headers": headers,
+                            "rows": []
+                        }
+                    
+                    for row in tbl[1:]:
+                        if any(row):
+                            table_groups[header_hash]["rows"].append([str(v or "").strip() for v in row])
 
-        if not all_data:
-            return JSONResponse(status_code=400, content={"message": "No tables found in this PDF"})
-
-        # 3. Excel file banana
-        final_df = pd.concat(all_data, ignore_index=True)
-        output_path = f"converted_{file.filename}.xlsx"
-        final_df.to_excel(output_path, index=False)
-
-        return FileResponse(
-            path=output_path, 
-            filename=f"converted_{file.filename}.xlsx",
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        for group in table_groups.values():
+            ws = wb.create_sheet(title=group["name"])
+            ws.append(group["headers"])
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            for row in group["rows"]:
+                ws.append(row)
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        raise HTTPException(500, f"Error: {str(e)}")
 
-# --- NETLIFY HANDLER (Ye sab se zaroori hai) ---
-handler = Mangum(app)
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f"attachment; filename=CatchPDF_{stem(file.filename)}.xlsx"})
+
+# NOTE: Keep all your other existing @app.post routes below this...
