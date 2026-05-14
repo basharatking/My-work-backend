@@ -1,83 +1,64 @@
 import os
-import io
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from PyPDF2 import PdfReader, PdfWriter
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from mangum import Mangum
+import pandas as pd
+import pdfplumber
 from dotenv import load_dotenv
 
-# Environment variables (.env file) load karne ke liye
+# Environment variables load karne ke liye
 load_dotenv()
 
-app = FastAPI(title="ITSPDF Utility API")
+app = FastAPI()
 
-# Netlify frontend ko connect karne ke liye CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- SECURE TOKEN SYSTEM ---
-# Ye 'os' library system ki settings se token uthayegi
-# Aapko code mein MyAi... likhne ki zaroorat nahi
+# Netlify settings se token uthane ke liye
+# Yaad rahe Netlify mein Key: MYAI_TOKEN honi chahiye
 API_TOKEN = os.getenv("MYAI_TOKEN")
 
 @app.get("/")
-async def health_check():
-    return {
-        "status": "online",
-        "project": "ITSPDF",
-        "auth_configured": API_TOKEN is not None
-    }
+def home():
+    return {"message": "Welcome to ITSPDF API. System is Live!"}
 
-# 1. PDF MERGE FUNCTION
-@app.post("/merge")
-async def merge_pdfs(files: list[UploadFile] = File(...)):
-    if not API_TOKEN:
-        raise HTTPException(status_code=500, detail="Server Error: Token missing in environment variables.")
-    
-    pdf_writer = PdfWriter()
-    try:
-        for file in files:
-            content = await file.read()
-            pdf_reader = PdfReader(io.BytesIO(content))
-            for page in pdf_reader.pages:
-                pdf_writer.add_page(page)
-
-        output = io.BytesIO()
-        pdf_writer.write(output)
-        output.seek(0)
-        
-        return StreamingResponse(
-            output,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=itspdf_merged.pdf"}
-        )
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-# 2. PDF INFO/METADATA FUNCTION
-@app.post("/metadata")
-async def get_metadata(file: UploadFile = File(...)):
-    try:
-        pdf_reader = PdfReader(io.BytesIO(await file.read()))
-        info = pdf_reader.metadata
-        return {
-            "filename": file.filename,
-            "pages": len(pdf_reader.pages),
-            "author": info.author if info.author else "Unknown",
-            "creator": info.creator if info.creator else "Unknown"
-        }
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-# 3. SECURITY CHECK ROUTE (Testing ke liye)
 @app.get("/verify-token")
-async def verify():
+def verify():
     if API_TOKEN:
-        # Security ke liye poora token nahi dikhayenge, sirf check karenge
-        return {"message": "Token is active and hidden", "prefix": API_TOKEN[:7]}
-    return {"message": "Token not found!"}
+        # Security ki wajah se pura token nahi dikhayenge
+        return {"status": "Active", "prefix": API_TOKEN[:7]}
+    return {"status": "Error", "message": "Token not found in Netlify settings"}
+
+@app.post("/convert-to-excel")
+async def convert_pdf_to_excel(file: UploadFile = File(...)):
+    # 1. Token Check
+    if not API_TOKEN:
+        raise HTTPException(status_code=500, detail="API Token missing in server settings")
+
+    # 2. PDF processing
+    try:
+        all_data = []
+        with pdfplumber.open(file.file) as pdf:
+            for page in pdf.pages:
+                table = page.extract_table()
+                if table:
+                    # Table data ko list mein add karna
+                    df = pd.DataFrame(table[1:], columns=table[0])
+                    all_data.append(df)
+
+        if not all_data:
+            return JSONResponse(status_code=400, content={"message": "No tables found in this PDF"})
+
+        # 3. Excel file banana
+        final_df = pd.concat(all_data, ignore_index=True)
+        output_path = f"converted_{file.filename}.xlsx"
+        final_df.to_excel(output_path, index=False)
+
+        return FileResponse(
+            path=output_path, 
+            filename=f"converted_{file.filename}.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- NETLIFY HANDLER (Ye sab se zaroori hai) ---
+handler = Mangum(app)
