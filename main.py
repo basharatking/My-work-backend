@@ -435,6 +435,198 @@ async def pdf_to_word(file: UploadFile = File(...)):
 @app.post("/pdf-to-excel")
 async def pdf_to_excel(file: UploadFile = File(...), mode: str = Form("smart")):
     data = await read_file(file)
+    if not _XL_OK:     raise HTTPException(500, "Excel library not available.")
+    if not _PLUMBER_OK: raise HTTPException(500, "PDF processing library not available.")
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    hdr_fill  = PatternFill("solid", fgColor="4F6EF7")
+    hdr_font  = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    alt_fill  = PatternFill("solid", fgColor="EEF1FF")
+    thin      = Side(style="thin", color="C5CEFF")
+    border    = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def norm_key(row):
+        """Normalise a header row into a hashable key for grouping."""
+        return tuple(re.sub(r"\s+", " ", str(c or "").strip().lower()) for c in row)
+
+    def looks_like_header(row):
+        """True when a row contains mostly text labels (not numbers)."""
+        cells = [str(c or "").strip() for c in row]
+        non_empty = [c for c in cells if c]
+        if len(non_empty) < 2:
+            return False
+        numeric = sum(
+            1 for c in non_empty
+            if re.match(r"^[\d\s\.\,\-\$\%\+\(\)\/]+$", c)
+        )
+        return (numeric / len(non_empty)) < 0.4
+
+    def find_header_idx(table):
+        """Return index of the first header-looking row (search first 4 rows)."""
+        for i, row in enumerate(table[:4]):
+            if looks_like_header(row):
+                return i
+        return 0   # fallback: treat first row as header
+
+    def make_sheet_name(header_cols, existing_names):
+        """Build a sheet name from actual column headers, e.g. 'Product / Region'."""
+        parts = [str(c).strip() for c in header_cols if str(c or "").strip()]
+        label = " / ".join(parts[:2]) if parts else "Table"
+        clean = re.sub(r"\s+", " ", re.sub(r"[\\/*?:\[\]]", "", label))[:31].strip() or "Table"
+        name, n = clean, 1
+        while name in existing_names:
+            name = f"{clean[:28]}_{n}"; n += 1
+        return name
+
+    def coerce_value(val: str):
+        """Try to convert a string cell to int or float; fall back to str."""
+        s = val.replace(",", "").replace("$", "").replace("%", "").strip()
+        if not s:
+            return ""
+        try:
+            return int(s) if "." not in s else float(s)
+        except (ValueError, TypeError):
+            return val
+
+    # ── Extraction ────────────────────────────────────────────────────────────
+    # table_groups: hkey → {sheet_name, header, rows, col_count}
+    table_groups: dict = {}
+    text_lines:   list = []
+
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for pn, page in enumerate(pdf.pages, start=1):
+
+                if mode in ("smart", "tables"):
+                    # Strategy 1 – explicit drawn borders
+                    tables = page.extract_tables({
+                        "vertical_strategy":   "lines_strict",
+                        "horizontal_strategy": "lines_strict",
+                        "snap_tolerance":  4,
+                        "join_tolerance":  4,
+                        "edge_min_length": 10,
+                        "min_words_vertical":   1,
+                        "min_words_horizontal": 1,
+                    }) or []
+
+                    # Strategy 2 – text alignment (borderless tables)
+                    if not tables:
+                        tables = page.extract_tables({
+                            "vertical_strategy":   "text",
+                            "horizontal_strategy": "text",
+                            "text_tolerance":      3,
+                            "intersection_tolerance": 3,
+                        }) or []
+
+                    for tbl in tables:
+                        if not tbl or len(tbl) < 2:
+                            continue
+
+                        hdr_idx  = find_header_idx(tbl)
+                        raw_hdr  = tbl[hdr_idx]
+                        if not any(str(c or "").strip() for c in raw_hdr):
+                            continue
+
+                        hkey     = norm_key(raw_hdr)
+                        disp_hdr = [str(c or "").strip() for c in raw_hdr]
+
+                        data_rows = [
+                            [str(c or "").strip() for c in row]
+                            for row in tbl[hdr_idx + 1:]
+                            if any(str(c or "").strip() for c in row)
+                        ]
+                        if not data_rows:
+                            continue
+
+                        # ── SMART GROUPING: same heading → same sheet ──────
+                        if hkey not in table_groups:
+                            sname = make_sheet_name(
+                                disp_hdr,
+                                [g["sheet_name"] for g in table_groups.values()]
+                            )
+                            table_groups[hkey] = {
+                                "sheet_name": sname,
+                                "header":     disp_hdr,
+                                "rows":       [],
+                                "col_count":  len(disp_hdr),
+                            }
+                        table_groups[hkey]["rows"].extend(data_rows)
+
+                # Text fallback
+                if mode == "text" or (mode == "smart" and not table_groups):
+                    raw_text = page.extract_text() or ""
+                    for ln in raw_text.split("\n"):
+                        if ln.strip():
+                            text_lines.append((pn, ln.strip()))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"PDF processing failed: {e}")
+
+    # ── Write workbook ────────────────────────────────────────────────────────
+    if table_groups:
+        for grp in table_groups.values():
+            ws = wb.create_sheet(title=grp["sheet_name"])
+            ws.freeze_panes = "A2"
+
+            # Header row
+            for ci, h in enumerate(grp["header"], start=1):
+                cell = ws.cell(row=1, column=ci, value=h)
+                cell.fill      = hdr_fill
+                cell.font      = hdr_font
+                cell.alignment = hdr_align
+                cell.border    = border
+
+            # Data rows (in page order, no extra annotation columns)
+            cols = grp["col_count"]
+            for ri, row in enumerate(grp["rows"], start=2):
+                padded = (row + [""] * cols)[:cols]
+                for ci, val in enumerate(padded, start=1):
+                    cell           = ws.cell(row=ri, column=ci, value=coerce_value(val))
+                    cell.border    = border
+                    if ri % 2 == 0:
+                        cell.fill  = alt_fill
+
+            # Auto column width
+            for col in ws.columns:
+                mx = max((len(str(c.value or "")) for c in col), default=10)
+                ws.column_dimensions[col[0].column_letter].width = min(max(mx + 3, 12), 60)
+
+    elif text_lines:
+        ws = wb.create_sheet(title="Extracted Text")
+        ws.freeze_panes = "A2"
+        for ci, h in enumerate(["Page", "Text"], start=1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.fill = hdr_fill; cell.font = hdr_font
+            cell.alignment = hdr_align; cell.border = border
+        for ri, (pg, ln) in enumerate(text_lines, start=2):
+            ws.cell(row=ri, column=1, value=pg).border   = border
+            ws.cell(row=ri, column=2, value=ln).border   = border
+            if ri % 2 == 0:
+                ws.cell(ri, 1).fill = alt_fill
+                ws.cell(ri, 2).fill = alt_fill
+        ws.column_dimensions["A"].width = 8
+        ws.column_dimensions["B"].width = 90
+
+    else:
+        ws = wb.create_sheet(title="No Data Found")
+        ws.cell(row=1, column=1, value="No tables or text could be extracted from this PDF.")
+        ws.cell(row=2, column=1, value="Tip: The PDF must contain selectable text (not a scanned image).")
+
+    out = io.BytesIO()
+    wb.save(out)
+    return stream_file(
+        out.getvalue(),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        f"{stem(file.filename)}.xlsx",
+    )
+    data = await read_file(file)
     if not _XL_OK: raise HTTPException(500, "Excel library not available.")
     if not _PLUMBER_OK: raise HTTPException(500, "PDF processing library not available.")
 
