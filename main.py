@@ -1110,3 +1110,91 @@ async def sign_pdf(
     buf = io.BytesIO()
     doc.save(buf, garbage=3, deflate=True)
     return stream_file(buf.getvalue(), "application/pdf", f"signed_{stem(file.filename)}.pdf")
+
+# ══════════════════════════════════════════════════════════════════
+# HTML → PDF
+# ══════════════════════════════════════════════════════════════════
+@app.post("/html-to-pdf")
+async def html_to_pdf(file: UploadFile = File(...)):
+    data = await read_file(file)
+    fname = (file.filename or "page.html").lower()
+
+    # Try WeasyPrint first (best quality, handles CSS/images)
+    try:
+        from weasyprint import HTML as WH, CSS
+        html_str = data.decode("utf-8", errors="replace")
+        pdf_bytes = WH(string=html_str, base_url=None).write_pdf()
+        return stream_file(pdf_bytes, "application/pdf", f"{stem(file.filename)}.pdf")
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: LibreOffice
+    if _libreoffice_available():
+        try:
+            pdf_bytes = _convert_with_libreoffice(data, "html", "pdf")
+            return stream_file(pdf_bytes, "application/pdf", f"{stem(file.filename)}.pdf")
+        except Exception:
+            pass
+
+    # Last resort: embed HTML text into a simple PDF via fitz
+    try:
+        html_str = data.decode("utf-8", errors="replace")
+        import re as _re
+        text = _re.sub(r"<[^>]+>", " ", html_str)
+        text = _re.sub(r"\s+", " ", text).strip()
+        doc = fitz.open()
+        page = doc.new_page()
+        rect = fitz.Rect(50, 50, 562, 742)
+        page.insert_textbox(rect, text, fontsize=11, fontname="helv")
+        buf = io.BytesIO()
+        doc.save(buf)
+        return stream_file(buf.getvalue(), "application/pdf", f"{stem(file.filename)}.pdf")
+    except Exception as e:
+        raise HTTPException(500, f"HTML to PDF conversion failed: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# PowerPoint → PDF  (pptx / ppt)
+# ══════════════════════════════════════════════════════════════════
+@app.post("/pptx-to-pdf")
+async def pptx_to_pdf(file: UploadFile = File(...)):
+    data = await read_file(file)
+    fname = (file.filename or "presentation.pptx").lower()
+    ext   = "pptx" if fname.endswith(".pptx") else "ppt"
+
+    # LibreOffice (best quality, preserves images/fonts)
+    if _libreoffice_available():
+        try:
+            pdf_bytes = _convert_with_libreoffice(data, ext, "pdf")
+            return stream_file(pdf_bytes, "application/pdf", f"{stem(file.filename)}.pdf")
+        except Exception:
+            pass
+
+    # Fallback: extract text from each slide via python-pptx and write to PDF
+    try:
+        from pptx import Presentation as _Prs
+        prs = _Prs(io.BytesIO(data))
+    except Exception as e:
+        raise HTTPException(400, f"Could not read PowerPoint file: {e}")
+
+    try:
+        doc = fitz.open()
+        for slide_num, slide in enumerate(prs.slides, start=1):
+            page = doc.new_page(width=792, height=612)   # landscape A4
+            lines = [f"Slide {slide_num}"]
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        t = para.text.strip()
+                        if t:
+                            lines.append(t)
+            text = "\n".join(lines)
+            rect = fitz.Rect(40, 40, 752, 572)
+            page.insert_textbox(rect, text, fontsize=13, fontname="helv")
+        buf = io.BytesIO()
+        doc.save(buf, garbage=3, deflate=True)
+        return stream_file(buf.getvalue(), "application/pdf", f"{stem(file.filename)}.pdf")
+    except Exception as e:
+        raise HTTPException(500, f"PowerPoint to PDF conversion failed: {e}")
