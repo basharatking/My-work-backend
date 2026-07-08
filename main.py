@@ -483,29 +483,9 @@ async def pdf_to_excel(file: UploadFile = File(...), mode: str = Form("smart")):
                 return i
         return 0
 
-    def is_continuation(tbl, known_keys):
-        """
-        Page-continuation detection: first row looks like data (not a header)
-        AND its column count matches a known group.
-        Used when a table on page N+1 starts with data rows (header already seen).
-        """
-        if not tbl:
-            return None
-        first = [clean(c) for c in tbl[0]]
-        ncols = len(first)
-        for key, grp in known_keys.items():
-            if grp["col_count"] == ncols and not looks_like_header(tbl[0]):
-                return key
-        return None
-
-    def make_sheet_name(header_cols, existing):
-        parts = [clean(c) for c in header_cols if clean(c)]
-        label = " / ".join(parts[:2]) if parts else "Table"
-        clean_name = re.sub(r"\s+", " ", re.sub(r"[\\/*?:\[\]]", "", label))[:31].strip() or "Table"
-        name, n = clean_name, 1
-        while name in existing:
-            name = f"{clean_name[:28]}_{n}"; n += 1
-        return name
+    def make_sheet_name(existing):
+        n = len(existing) + 1
+        return f"Table {n}"
 
     def coerce(val):
         s = re.sub(r"[,\$%]", "", clean(val))
@@ -524,129 +504,111 @@ async def pdf_to_excel(file: UploadFile = File(...), mode: str = Form("smart")):
         return None
 
     # ── Extraction ────────────────────────────────────────────────────────────
-    # table_groups: hkey → {sheet_name, header, rows, col_count}
     table_groups: dict = {}
     text_lines:   list = []
 
-    # Track the last seen table on the previous page for continuation detection
-    last_page_groups: list = []
-
     TABLE_SETTINGS = [
-        # Strategy 1: explicit lines (bordered tables)
-        {
-            "vertical_strategy":    "lines_strict",
-            "horizontal_strategy":  "lines_strict",
-            "snap_tolerance":  4,
-            "join_tolerance":  4,
-            "edge_min_length": 10,
-            "min_words_vertical":   1,
-            "min_words_horizontal": 1,
-        },
-        # Strategy 2: text alignment (borderless / whitespace-separated)
-        {
-            "vertical_strategy":   "text",
-            "horizontal_strategy": "text",
-            "text_tolerance":      4,
-            "intersection_tolerance": 4,
-        },
-        # Strategy 3: explicit lines fallback (looser)
-        {
-            "vertical_strategy":   "lines",
-            "horizontal_strategy": "lines",
-            "snap_tolerance":  6,
-            "join_tolerance":  6,
-            "edge_min_length": 6,
-        },
+        # Strategy 1: explicit borders
+        {"vertical_strategy": "lines_strict", "horizontal_strategy": "lines_strict",
+         "snap_tolerance": 4, "join_tolerance": 4, "edge_min_length": 10,
+         "min_words_vertical": 1, "min_words_horizontal": 1},
+        # Strategy 2: text-aligned (borderless)
+        {"vertical_strategy": "text", "horizontal_strategy": "text",
+         "text_tolerance": 4, "intersection_tolerance": 4},
+        # Strategy 3: looser lines
+        {"vertical_strategy": "lines", "horizontal_strategy": "lines",
+         "snap_tolerance": 6, "join_tolerance": 6, "edge_min_length": 6},
     ]
+
+    def extract_page_tables(page):
+        """Try each strategy, return first that yields valid tables."""
+        for s in TABLE_SETTINGS:
+            try:
+                tbls = page.extract_tables(s) or []
+                tbls = [[[clean(c) for c in row] for row in t]
+                        for t in tbls
+                        if t and len(t) >= 2
+                        and max((len(r) for r in t), default=0) >= 2]
+                if tbls:
+                    return tbls
+            except Exception:
+                continue
+        return []
 
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
+            # Pass 1: collect ALL tables from ALL pages with their page number
+            all_tables = []  # list of (page_num, table)
             for pn, page in enumerate(pdf.pages, start=1):
-                page_tables = []
-
                 if mode in ("smart", "tables"):
-                    for settings in TABLE_SETTINGS:
-                        try:
-                            tbls = page.extract_tables(settings) or []
-                        except Exception:
-                            tbls = []
-                        # Accept tables with ≥2 rows and ≥2 columns
-                        tbls = [t for t in tbls if t and len(t) >= 2
-                                and max((len(r) for r in t), default=0) >= 2]
-                        if tbls:
-                            page_tables = tbls
-                            break
-
-                    for tbl in page_tables:
-                        # Normalise all cells
-                        tbl = [[clean(c) for c in row] for row in tbl]
-
-                        # ── Continuation detection ─────────────────────────────
-                        # If the first row looks like DATA (not a header) and
-                        # column count matches a group seen on the previous page,
-                        # treat this table as a continuation — skip repeating header.
-                        continuation_key = None
-                        if last_page_groups and not looks_like_header(tbl[0]):
-                            for lpk in last_page_groups:
-                                if lpk in table_groups:
-                                    if table_groups[lpk]["col_count"] == len(tbl[0]):
-                                        continuation_key = lpk
-                                        break
-
-                        if continuation_key:
-                            # Append all rows (no header, skip if first row repeats header)
-                            grp = table_groups[continuation_key]
-                            for row in tbl:
-                                norm_row = norm_key(row)
-                                # Skip if this row IS the repeated header
-                                if fuzzy_match(norm_row, continuation_key):
-                                    continue
-                                if any(v for v in row):
-                                    grp["rows"].append(row)
-                            last_page_groups = [continuation_key]
-                            continue
-
-                        # ── Normal table with its own header ──────────────────
-                        hdr_idx  = find_header_idx(tbl)
-                        raw_hdr  = tbl[hdr_idx]
-                        if not any(raw_hdr):
-                            continue
-
-                        hkey     = norm_key(raw_hdr)
-                        disp_hdr = raw_hdr
-
-                        data_rows = [
-                            row for row in tbl[hdr_idx + 1:]
-                            if any(v for v in row)
-                            and not fuzzy_match(norm_key(row), hkey)  # skip repeated headers
-                        ]
-                        if not data_rows:
-                            continue
-
-                        # ── Smart grouping: fuzzy-match to existing group ─────
-                        matched = find_matching_group(hkey, table_groups)
-                        if matched:
-                            table_groups[matched]["rows"].extend(data_rows)
-                            last_page_groups = [matched]
-                        else:
-                            sname = make_sheet_name(
-                                disp_hdr,
-                                [g["sheet_name"] for g in table_groups.values()]
-                            )
-                            table_groups[hkey] = {
-                                "sheet_name": sname,
-                                "header":     disp_hdr,
-                                "rows":       data_rows,
-                                "col_count":  len(disp_hdr),
-                            }
-                            last_page_groups = [hkey]
-
-                # Text fallback
-                if mode == "text" or (mode == "smart" and not page_tables and not table_groups):
+                    for tbl in extract_page_tables(page):
+                        all_tables.append((pn, tbl))
+                if mode == "text":
                     raw = page.extract_text() or ""
                     for ln in raw.split("\n"):
                         if ln.strip():
                             text_lines.append((pn, ln.strip()))
+
+            # Pass 2: group tables by header across all pages
+            # table_groups key → {sheet_name, header, rows, col_count}
+            for pn, tbl in all_tables:
+                if not tbl:
+                    continue
+
+                hdr_idx = find_header_idx(tbl)
+                raw_hdr = tbl[hdr_idx]
+
+                if not any(raw_hdr):
+                    continue
+
+                hkey     = norm_key(raw_hdr)
+                disp_hdr = raw_hdr
+                col_count = len(raw_hdr)
+
+                # Collect data rows — skip empty, skip repeated header rows
+                data_rows = []
+                for row in tbl[hdr_idx + 1:]:
+                    if not any(v for v in row):
+                        continue
+                    rk = norm_key(row)
+                    # Skip if this row is a repeated header
+                    if fuzzy_match(rk, hkey):
+                        continue
+                    data_rows.append(row)
+
+                if not data_rows:
+                    continue
+
+                # Find if a matching group already exists
+                matched = find_matching_group(hkey, table_groups)
+
+                if matched:
+                    # Merge into existing sheet
+                    grp = table_groups[matched]
+                    # Pad/trim rows to match existing col count
+                    c = grp["col_count"]
+                    for row in data_rows:
+                        grp["rows"].append((row + [""] * c)[:c])
+                else:
+                    # New group → new sheet
+                    sname = make_sheet_name(
+                        [g["sheet_name"] for g in table_groups.values()]
+                    )
+                    table_groups[hkey] = {
+                        "sheet_name": sname,
+                        "header":     disp_hdr,
+                        "rows":       data_rows,
+                        "col_count":  col_count,
+                    }
+
+            # If no tables found at all, fallback to text extraction
+            if not table_groups and not text_lines and mode != "text":
+                with pdfplumber.open(io.BytesIO(data)) as pdf2:
+                    for pn, page in enumerate(pdf2.pages, start=1):
+                        raw = page.extract_text() or ""
+                        for ln in raw.split("\n"):
+                            if ln.strip():
+                                text_lines.append((pn, ln.strip()))
 
     except HTTPException:
         raise
