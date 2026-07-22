@@ -1076,20 +1076,22 @@ async def pptx_to_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"PowerPoint to PDF conversion failed: {e}")
         # ── Paddle Webhook ──────────────────────────────────────────
-import os, json, hashlib, hmac
-from supabase import create_client
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET")
+import os as _os
+import json as _json
+from supabase import create_client as _create_client
 
 @app.post("/paddle/webhook")
 async def paddle_webhook(request: Request):
     try:
         body = await request.body()
-        payload = json.loads(body)
+        payload = _json.loads(body)
         event_type = payload.get("event_type", "")
         data = payload.get("data", {})
+
+        sb = _create_client(
+            _os.getenv("SUPABASE_URL"),
+            _os.getenv("SUPABASE_SERVICE_KEY")
+        )
 
         if event_type in ["subscription.created", "subscription.updated"]:
             custom_data = data.get("custom_data", {})
@@ -1098,10 +1100,9 @@ async def paddle_webhook(request: Request):
             paddle_subscription_id = data.get("id")
             paddle_customer_id = data.get("customer_id")
             status = data.get("status", "active")
-            billing_period = "yearly" if "year" in str(data.get("billing_cycle", {}).get("interval", "")) else "monthly"
-
+            billing = data.get("billing_cycle", {}).get("interval", "month")
+            billing_period = "yearly" if "year" in str(billing) else "monthly"
             if user_id:
-                sb = create_client(SUPABASE_URL, SUPABASE_KEY)
                 sb.table("Subscriptions").upsert({
                     "User_id": user_id,
                     "paddle_subscription_id": paddle_subscription_id,
@@ -1114,7 +1115,6 @@ async def paddle_webhook(request: Request):
         elif event_type == "subscription.canceled":
             paddle_subscription_id = data.get("id")
             if paddle_subscription_id:
-                sb = create_client(SUPABASE_URL, SUPABASE_KEY)
                 sb.table("Subscriptions").update({
                     "Status": "canceled",
                     "Plan": "free"
@@ -1123,3 +1123,4 @@ async def paddle_webhook(request: Request):
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
