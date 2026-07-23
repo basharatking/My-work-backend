@@ -1075,9 +1075,11 @@ async def pptx_to_pdf(file: UploadFile = File(...)):
         return stream_file(buf.getvalue(), "application/pdf", f"{stem(file.filename)}.pdf")
     except Exception as e:
         raise HTTPException(500, f"PowerPoint to PDF conversion failed: {e}")
-        # ── Paddle Webhook ──────────────────────────────────────────
-        import os as _os
+
+
+# ── Paddle Webhook ──────────────────────────────────────────
 import json as _json
+import os as _os
 from supabase import create_client as _create_client
 
 @app.post("/paddle/webhook")
