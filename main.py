@@ -1076,7 +1076,7 @@ async def pptx_to_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"PowerPoint to PDF conversion failed: {e}")
         # ── Paddle Webhook ──────────────────────────────────────────
-import os as _os
+        import os as _os
 import json as _json
 from supabase import create_client as _create_client
 
@@ -1087,12 +1087,7 @@ async def paddle_webhook(request: Request):
         payload = _json.loads(body)
         event_type = payload.get("event_type", "")
         data = payload.get("data", {})
-
-        sb = _create_client(
-            _os.getenv("SUPABASE_URL"),
-            _os.getenv("SUPABASE_SERVICE_KEY")
-        )
-
+        sb = _create_client(_os.getenv("SUPABASE_URL"), _os.getenv("SUPABASE_SERVICE_KEY"))
         if event_type in ["subscription.created", "subscription.updated"]:
             custom_data = data.get("custom_data", {})
             user_id = custom_data.get("user_id")
@@ -1103,24 +1098,11 @@ async def paddle_webhook(request: Request):
             billing = data.get("billing_cycle", {}).get("interval", "month")
             billing_period = "yearly" if "year" in str(billing) else "monthly"
             if user_id:
-                sb.table("Subscriptions").upsert({
-                    "User_id": user_id,
-                    "paddle_subscription_id": paddle_subscription_id,
-                    "paddle_customer_id": paddle_customer_id,
-                    "Plan": plan,
-                    "Status": status,
-                    "billing_period": billing_period,
-                }, on_conflict="paddle_subscription_id").execute()
-
+                sb.table("Subscriptions").upsert({"User_id": user_id, "paddle_subscription_id": paddle_subscription_id, "paddle_customer_id": paddle_customer_id, "Plan": plan, "Status": status, "billing_period": billing_period}, on_conflict="paddle_subscription_id").execute()
         elif event_type == "subscription.canceled":
             paddle_subscription_id = data.get("id")
             if paddle_subscription_id:
-                sb.table("Subscriptions").update({
-                    "Status": "canceled",
-                    "Plan": "free"
-                }).eq("paddle_subscription_id", paddle_subscription_id).execute()
-
+                sb.table("Subscriptions").update({"Status": "canceled", "Plan": "free"}).eq("paddle_subscription_id", paddle_subscription_id).execute()
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
-
