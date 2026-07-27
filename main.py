@@ -1,14 +1,13 @@
-# RunDocs Backend v2.0 — main.py
-# KEY FIXES:
-# 1. PDF-to-Excel: Tables grouped by HEADER SIGNATURE across ALL pages (NOT page-wise)
-# 2. Watermark: Fixed fill_opacity parameter & proper overlay rendering
+# RunDocs PDF Server v2.0
+# Handles all PDF processing tools
+# Deploy on: Replit / Render / Railway
 
 import io, os, re, zipfile, json, time
 import subprocess, tempfile, shutil
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -45,16 +44,7 @@ try:
 except ImportError:
     _PPTX_OK = False
 
-try:
-    import requests as _req
-    _HF_TOKEN = os.environ.get("HF_TOKEN", "")
-    _HF_MODEL = os.environ.get("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
-    _HF_URL   = f"https://api-inference.huggingface.co/models/{_HF_MODEL}"
-    _AI_OK    = bool(_HF_TOKEN)
-except Exception:
-    _AI_OK = False
-
-app = FastAPI(title="RunDocs API", version="2.0.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="RunDocs PDF Server", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 MAX_BYTES = 25 * 1024 * 1024
@@ -96,37 +86,6 @@ def extract_text_fitz(data: bytes, max_pages: int = 40) -> str:
     return "\n\n".join(doc[i].get_text() for i in range(pages))
 
 
-def ai_call(system: str, prompt: str, max_tokens: int = 1500) -> str:
-    if not _AI_OK:
-        raise HTTPException(503, "AI Tools unavailable. Add HF_TOKEN in Replit Secrets.")
-    full_prompt = f"<s>[INST] {system}\n\n{prompt} [/INST]"
-    headers = {"Authorization": f"Bearer {_HF_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "inputs": full_prompt,
-        "parameters": {"max_new_tokens": min(max_tokens, 1200), "temperature": 0.4, "top_p": 0.9, "do_sample": True, "return_full_text": False},
-        "options": {"wait_for_model": True, "use_cache": False},
-    }
-    try:
-        resp = _req.post(_HF_URL, headers=headers, json=payload, timeout=90)
-        if resp.status_code == 503:
-            time.sleep(15)
-            resp = _req.post(_HF_URL, headers=headers, json=payload, timeout=90)
-        if resp.status_code == 401:
-            raise HTTPException(503, "Invalid HuggingFace token.")
-        if not resp.ok:
-            err = resp.json() if resp.content else {}
-            raise HTTPException(502, f"AI error: {err.get('error', resp.status_code)}")
-        result = resp.json()
-        text = result[0].get("generated_text", "") if isinstance(result, list) else result.get("generated_text", "")
-        for m in ["[/INST]", "[INST]", "<s>", "</s>"]:
-            text = text.replace(m, "")
-        return text.strip() or "No result generated."
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, f"AI error: {str(e)}")
-
-
 def _to_roman(n: int) -> str:
     val = [1000,900,500,400,100,90,50,40,10,9,5,4,1]
     sym = ["M","CM","D","CD","C","XC","L","XL","X","IX","V","IV","I"]
@@ -137,79 +96,19 @@ def _to_roman(n: int) -> str:
     return result.lower()
 
 
+@app.get("/")
 @app.get("/health")
 def health():
-    return {"status": "ok", "brand": "RunDocs", "version": "2.0.0",
-            "fitz": _FITZ_OK, "plumber": _PLUMBER_OK, "docx": _DOCX_OK,
-            "xlsx": _XL_OK, "pptx": _PPTX_OK, "ai": _AI_OK}
-
-
-# ══════════════════════════════════════════
-# AI ENDPOINTS
-# ══════════════════════════════════════════
-
-@app.post("/ai-summary")
-async def ai_summary(file: UploadFile = File(...), length: str = Form("medium")):
-    data = await read_file(file)
-    text = extract_text_fitz(data, 20)
-    if not text.strip(): raise HTTPException(400, "No readable text found.")
-    lens = {"short": "2–3 sentences", "medium": "1 clear paragraph", "long": "2–3 detailed paragraphs"}
-    result = ai_call("You are a professional document summarizer. Return only the summary.", f"Summarize in {lens.get(length,'1 paragraph')}:\n\n{text[:8000]}")
-    return {"result": result}
-
-@app.post("/ai-notes")
-async def ai_notes(file: UploadFile = File(...), style: str = Form("bullet")):
-    data = await read_file(file)
-    text = extract_text_fitz(data, 25)
-    if not text.strip(): raise HTTPException(400, "No readable text found.")
-    style_map = {"bullet": "bullet point notes", "outline": "hierarchical outline", "cornell": "Cornell-style notes", "mindmap": "text-based mind map"}
-    result = ai_call("You are an expert study notes creator. Return only formatted notes.", f"Create {style_map.get(style,'bullet points')}:\n\n{text[:9000]}")
-    return {"result": result}
-
-@app.post("/ai-quiz")
-async def ai_quiz(file: UploadFile = File(...), count: int = Form(10), difficulty: str = Form("medium")):
-    data = await read_file(file)
-    text = extract_text_fitz(data, 20)
-    if not text.strip(): raise HTTPException(400, "No readable text found.")
-    count = max(3, min(count, 20))
-    result = ai_call("You are a quiz creator. Return numbered questions with A–D options and mark correct answer with ✓.", f"Create {count} {difficulty} questions:\n\n{text[:8000]}")
-    return {"result": result}
-
-@app.post("/ai-keypoints")
-async def ai_keypoints(file: UploadFile = File(...)):
-    data = await read_file(file)
-    text = extract_text_fitz(data, 20)
-    if not text.strip(): raise HTTPException(400, "No readable text found.")
-    result = ai_call("Extract the most important information as a numbered list.", f"Extract 8–12 key points:\n\n{text[:8000]}")
-    return {"result": result}
-
-@app.post("/ai-translate")
-async def ai_translate(file: UploadFile = File(...), from_lang: str = Form("auto"), to_lang: str = Form("Urdu")):
-    data = await read_file(file)
-    text = extract_text_fitz(data, 15)
-    if not text.strip(): raise HTTPException(400, "No readable text found.")
-    src = f"from {from_lang}" if from_lang != "auto" else "(auto-detect)"
-    result = ai_call(f"Translate accurately {src} to {to_lang}. Return only translated text.", f"Translate to {to_lang}:\n\n{text[:6000]}")
-    return {"result": result}
-
-@app.post("/ask-pdf")
-async def ask_pdf(file: UploadFile = File(...), question: str = Form(...), history: str = Form("[]")):
-    data = await read_file(file)
-    text = extract_text_fitz(data, 30)
-    if not text.strip(): raise HTTPException(400, "No readable text found.")
-    try: hist = json.loads(history)[-6:]
-    except: hist = []
-    ctx = "\n".join(f"Q: {h['q']}\nA: {h['a']}" for h in hist if "q" in h and "a" in h)
-    prompt = f"Document:\n{text[:9000]}\n\n"
-    if ctx: prompt += f"Previous:\n{ctx}\n\n"
-    prompt += f"Question: {question}"
-    result = ai_call("Answer questions based strictly on the document. If not found, say so.", prompt, 1500)
-    return {"result": result}
-
-
-# ══════════════════════════════════════════
-# PDF ORGANIZE
-# ══════════════════════════════════════════
+    return {
+        "status": "ok",
+        "server": "RunDocs PDF Server",
+        "version": "2.0.0",
+        "fitz": _FITZ_OK,
+        "plumber": _PLUMBER_OK,
+        "docx": _DOCX_OK,
+        "xlsx": _XL_OK,
+        "pptx": _PPTX_OK,
+    }
 
 @app.post("/merge-pdf")
 async def merge_pdf(files: List[UploadFile] = File(...)):
@@ -1075,6 +974,12 @@ async def pptx_to_pdf(file: UploadFile = File(...)):
         return stream_file(buf.getvalue(), "application/pdf", f"{stem(file.filename)}.pdf")
     except Exception as e:
         raise HTTPException(500, f"PowerPoint to PDF conversion failed: {e}")
+
+
+# ── Paddle Webhook ──────────────────────────────────────────
+import json as _json
+import os as _os
+from supabase import create_client as _create_client
 
 
 # ── Paddle Webhook ──────────────────────────────────────────

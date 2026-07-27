@@ -1,22 +1,11 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-python-multipart==0.0.9
-pymupdf==1.24.3
-pdfplumber==0.11.0
-python-docx==1.1.2
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+PyMuPDF==1.23.8
+pdfplumber==0.10.3
+python-docx==1.1.0
 openpyxl==3.1.2
 python-pptx==0.6.23
-requests==2.31.0
-
-# NOTE: word-to-pdf and excel-to-pdf endpoints use LibreOffice (system binary,
-# not a pip package) for accurate conversion. Install separately:
-#
-# On Replit (replit.nix), add:
-#   pkgs.libreoffice
-#
-# On Render/Railway (Docker), add to your Dockerfile:
-#   RUN apt-get update && apt-get install -y libreoffice
-#
-# If LibreOffice is not installed, those two endpoints automatically fall
-# back to a simplified text-only PDF so they never hard-crash — but for best
-# quality (fonts, layout, images preserved), install LibreOffice.
+Pillow==10.1.0
+supabase==2.3.0
+pydantic==2.5.2
