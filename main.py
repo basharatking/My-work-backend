@@ -975,13 +975,6 @@ async def pptx_to_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"PowerPoint to PDF conversion failed: {e}")
 
-
-# ── Paddle Webhook ──────────────────────────────────────────
-import json as _json
-import os as _os
-from supabase import create_client as _create_client
-
-
 # ── Paddle Webhook ──────────────────────────────────────────
 import json as _json
 import os as _os
